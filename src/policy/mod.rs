@@ -502,12 +502,12 @@ mod tests {
                 Tr::<String>::from_str(
                     "tr(UNSPEND ,{
                 {
-                    {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(B),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H))},
-                    {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(E)),pk(F)),pk(G)),pk(H))}
+                    {and_v(v:and_v(v:and_v(v:pk(B),pk(C)),and_v(v:pk(D),pk(E))),and_v(v:and_v(v:pk(F),pk(G)),pk(H))),and_v(v:and_v(v:and_v(v:pk(A),pk(C)),and_v(v:pk(D),pk(E))),and_v(v:and_v(v:pk(F),pk(G)),pk(H)))},
+                    {and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(D),pk(E))),and_v(v:and_v(v:pk(F),pk(G)),pk(H))),and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(C),pk(E))),and_v(v:and_v(v:pk(F),pk(G)),pk(H)))}
                 },
                 {
-                    {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(D)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(D)),pk(E)),pk(G)),pk(H))},
-                    {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(D)),pk(E)),pk(F)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(D)),pk(E)),pk(F)),pk(G))}
+                    {and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(C),pk(D))),and_v(v:and_v(v:pk(F),pk(G)),pk(H))),and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(C),pk(D))),and_v(v:and_v(v:pk(E),pk(G)),pk(H)))},
+                    {and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(C),pk(D))),and_v(v:and_v(v:pk(E),pk(F)),pk(H))),and_v(v:and_v(v:and_v(v:pk(A),pk(B)),and_v(v:pk(C),pk(D))),and_v(v:and_v(v:pk(E),pk(F)),pk(G)))}
                 }})"
                     .replace(&['\t', ' ', '\n'][..], "")
                     .as_str(),

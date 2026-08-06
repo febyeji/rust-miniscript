@@ -1054,9 +1054,22 @@ where
                 }
             }
             if thresh.is_and() {
-                let mut it = thresh.iter();
-                let mut policy = it.next().expect("No sub policy in thresh() ?").clone();
-                policy = it.fold(policy, |acc, pol| Concrete::And(vec![acc, pol.clone()]).into());
+                // Combine adjacent policies level by level, preserving order while keeping
+                // compiler-generated recursion depth logarithmic in the threshold width.
+                let mut policies: Vec<_> = thresh.iter().cloned().collect();
+                while policies.len() > 1 {
+                    let mut next_level = Vec::with_capacity((policies.len() + 1) / 2);
+                    let mut it = policies.into_iter();
+                    while let Some(left) = it.next() {
+                        let policy = match it.next() {
+                            Some(right) => Concrete::And(vec![left, right]).into(),
+                            None => left,
+                        };
+                        next_level.push(policy);
+                    }
+                    policies = next_level;
+                }
+                let policy = policies.pop().expect("No sub policy in thresh() ?");
 
                 ret = best_compilations(policy_cache, policy.as_ref(), sat_prob, dissat_prob)?;
             }
@@ -1523,6 +1536,21 @@ mod tests {
                 assert_eq!(big_thresh_ms, big_thresh_ms_expected);
             };
         }
+    }
+
+    #[test]
+    fn compile_large_n_of_n_threshold_does_not_overflow() {
+        let (keys, _) = pubkeys_and_a_sig(999);
+        let thresh = Threshold::from_iter(
+            keys.len(),
+            keys.into_iter().map(|key| Arc::new(Concrete::Key(key))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            Concrete::Thresh(thresh).compile::<Segwitv0>(),
+            Err(CompilerError::LimitsExceeded),
+        );
     }
 
     #[test]

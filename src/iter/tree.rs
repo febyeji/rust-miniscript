@@ -173,7 +173,7 @@ impl<T: TreeLike> Iterator for PostOrderIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut current = self.stack.pop()?;
 
-        if !current.processed {
+        while !current.processed {
             current.processed = true;
 
             // When we first encounter an item, it is completely unknown; it is
@@ -188,25 +188,25 @@ impl<T: TreeLike> Iterator for PostOrderIter<T> {
                     Some(current_stack_idx),
                 ));
             }
-            self.next()
-        } else {
-            // The second time we encounter an item, we have dealt with its children,
-            // updated the child indices for this item, and are now ready to yield it
-            // rather than putting it back in the stack.
-            //
-            // Before yielding though, we must the item's parent's child indices with
-            // this item's index.
-            if let Some(idx) = current.parent_stack_idx {
-                self.stack[idx].child_indices.push(self.index);
-            }
-
-            self.index += 1;
-            Some(PostOrderIterItem {
-                node: current.elem,
-                index: self.index - 1,
-                child_indices: current.child_indices,
-            })
+            current = self.stack.pop()?;
         }
+
+        // The second time we encounter an item, we have dealt with its children,
+        // updated the child indices for this item, and are now ready to yield it
+        // rather than putting it back in the stack.
+        //
+        // Before yielding though, we must update the item's parent's child indices with
+        // this item's index.
+        if let Some(idx) = current.parent_stack_idx {
+            self.stack[idx].child_indices.push(self.index);
+        }
+
+        self.index += 1;
+        Some(PostOrderIterItem {
+            node: current.elem,
+            index: self.index - 1,
+            child_indices: current.child_indices,
+        })
     }
 }
 

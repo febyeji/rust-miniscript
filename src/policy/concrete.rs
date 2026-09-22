@@ -1289,6 +1289,30 @@ mod compiler_tests {
     }
 
     #[test]
+    fn compile_large_and_threshold() {
+        fn policy(n: usize) -> Policy<String> {
+            // A shallow policy whose n-of-n threshold is lowered to a deeply nested And chain.
+            let keys = (0..n).map(|i| Arc::new(Policy::Key(format!("K{}", i))));
+            Policy::Or(vec![
+                (NonZeroU32::new(99).unwrap(), Arc::new(Policy::Key("I".to_owned()))),
+                (
+                    NonZeroU32::new(1).unwrap(),
+                    Arc::new(Policy::Thresh(Threshold::from_iter(n, keys).unwrap())),
+                ),
+            ])
+        }
+
+        assert_eq!(policy(999).compile::<crate::Segwitv0>(), Err(CompilerError::LimitsExceeded));
+
+        // Keep successful Taproot compilations smaller so the regression test is affordable.
+        let policy = policy(32);
+        assert!(policy.compile::<Tap>().is_ok());
+        assert!(policy.compile_tr(None).is_ok());
+        assert!(policy.compile_tr_native(None, 1024).is_ok());
+        assert!(policy.compile_tr_private_experimental(None).is_ok());
+    }
+
+    #[test]
     fn test_gen_comb() {
         let policies: Vec<Arc<Concrete<String>>> = vec!["pk(A)", "pk(B)", "pk(C)", "pk(D)"]
             .into_iter()

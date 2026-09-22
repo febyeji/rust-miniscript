@@ -5,6 +5,8 @@
 //! Optimizing compiler from concrete policies to Miniscript
 //!
 
+mod work;
+
 use core::num::NonZeroU32;
 use core::{fmt, mem};
 #[cfg(feature = "std")]
@@ -12,6 +14,9 @@ use std::error;
 
 use sync::Arc;
 
+use self::work::{
+    flatten_policy, or_dissat_probs, or_weights, threshold_probs, CompilationTask, PolicyNode,
+};
 use crate::miniscript::context::SigType;
 use crate::miniscript::limits::{MAX_PUBKEYS_IN_CHECKSIGADD, MAX_PUBKEYS_PER_MULTISIG};
 use crate::miniscript::types::{self, ErrorKind, Type};
@@ -20,10 +25,20 @@ use crate::policy::Concrete;
 use crate::prelude::*;
 use crate::{policy, Miniscript, MiniscriptKey, PositiveF64, Terminal};
 
-type PolicyCache<Pk, Ctx> = BTreeMap<
-    (Concrete<Pk>, PositiveF64, Option<PositiveF64>),
-    BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>,
->;
+type PolicyCache<Pk, Ctx> =
+    BTreeMap<CompilationTask, BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>>;
+
+fn cached_compilations<Pk: MiniscriptKey, Ctx: ScriptContext>(
+    cache: &PolicyCache<Pk, Ctx>,
+    policy: usize,
+    sat_prob: PositiveF64,
+    dissat_prob: Option<PositiveF64>,
+) -> &BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>> {
+    cache
+        .get(&CompilationTask::new(policy, sat_prob, dissat_prob))
+        .expect("compilation dependencies are processed before their parent")
+}
+
 /// Detailed error type for compiler.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum CompilerError {
@@ -103,138 +118,77 @@ impl fmt::Display for CompilerError {
 
 fn best_compilations_or<Pk: MiniscriptKey, Ctx: ScriptContext>(
     ret: &mut BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>,
-    policy_cache: &mut PolicyCache<Pk, Ctx>,
-    policy: &Concrete<Pk>,
-    subs: &[(NonZeroU32, Arc<Concrete<Pk>>)],
-    sat_prob: PositiveF64,
-    dissat_prob: Option<PositiveF64>,
-) -> Result<(), CompilerError> {
-    let total = PositiveF64::from(subs[0].0) + PositiveF64::from(subs[1].0);
-    let lw = PositiveF64::from(subs[0].0) / total;
-    let rw = PositiveF64::from(subs[1].0) / total;
+    policy_cache: &PolicyCache<Pk, Ctx>,
+    nodes: &[PolicyNode<'_, Pk>],
+    task: CompilationTask,
+    subs: &[(NonZeroU32, usize); 2],
+) {
+    let CompilationTask { sat_prob, dissat_prob, .. } = task;
+    let (lw, rw) = or_weights(subs);
 
     //and-or
-    let mut insert_ternary = |policy_cache: &mut _,
-                              a: &BTreeMap<_, _>,
+    let mut insert_ternary = |a: &BTreeMap<_, _>,
                               b: &BTreeMap<_, _>,
                               c: &BTreeMap<_, _>,
                               lw: PositiveF64,
-                              rw: PositiveF64|
-     -> Result<(), CompilerError> {
+                              rw: PositiveF64| {
         for a in a.values() {
             for b in b.values() {
                 for c in c.values() {
                     if let Ok(new_ext) = AstElemExt::and_or(a, b, c, lw, rw) {
-                        insert_best_wrapped(
-                            policy_cache,
-                            policy,
-                            ret,
-                            new_ext,
-                            sat_prob,
-                            dissat_prob,
-                        )?;
+                        insert_best_wrapped(policy_cache, task, ret, new_ext);
                     }
                 }
             }
         }
-        Ok(())
     };
 
-    if let (Concrete::And(x), _) = (subs[0].1.as_ref(), subs[1].1.as_ref()) {
-        let a1 = best_compilations(
-            policy_cache,
-            x[0].as_ref(),
-            lw * sat_prob,
-            Some((rw * sat_prob).conditional_add(dissat_prob)),
-        )?;
-        let a2 = best_compilations(policy_cache, x[0].as_ref(), lw * sat_prob, None)?;
-
-        let b1 = best_compilations(
-            policy_cache,
-            x[1].as_ref(),
-            lw * sat_prob,
-            Some((rw * sat_prob).conditional_add(dissat_prob)),
-        )?;
-        let b2 = best_compilations(policy_cache, x[1].as_ref(), lw * sat_prob, None)?;
-
-        let c = best_compilations(policy_cache, subs[1].1.as_ref(), rw * sat_prob, dissat_prob)?;
-
-        insert_ternary(policy_cache, &a1, &b2, &c, lw, rw)?;
-        insert_ternary(policy_cache, &b1, &a2, &c, lw, rw)?;
-    };
-    if let (_, Concrete::And(x)) = (&subs[0].1.as_ref(), subs[1].1.as_ref()) {
-        let a1 = best_compilations(
-            policy_cache,
-            x[0].as_ref(),
-            rw * sat_prob,
-            Some((lw * sat_prob).conditional_add(dissat_prob)),
-        )?;
-        let a2 = best_compilations(policy_cache, x[0].as_ref(), rw * sat_prob, None)?;
-
-        let b1 = best_compilations(
-            policy_cache,
-            x[1].as_ref(),
-            rw * sat_prob,
-            Some((lw * sat_prob).conditional_add(dissat_prob)),
-        )?;
-        let b2 = best_compilations(policy_cache, x[1].as_ref(), rw * sat_prob, None)?;
-
-        let c = best_compilations(policy_cache, subs[0].1.as_ref(), lw * sat_prob, dissat_prob)?;
-
-        insert_ternary(policy_cache, &a1, &b2, &c, rw, lw)?;
-        insert_ternary(policy_cache, &b1, &a2, &c, rw, lw)?;
-    };
-
-    let dissat_probs = |w: PositiveF64| -> Vec<Option<PositiveF64>> {
-        vec![
-            Some((w * sat_prob).conditional_add(dissat_prob)),
-            Some(w * sat_prob),
-            dissat_prob,
-            None,
-        ]
-    };
-
-    let mut l_comp = vec![];
-    let mut r_comp = vec![];
-
-    for dissat_prob in dissat_probs(rw).iter() {
-        let l = best_compilations(policy_cache, subs[0].1.as_ref(), lw * sat_prob, *dissat_prob)?;
-        l_comp.push(l);
-    }
-
-    for dissat_prob in dissat_probs(lw).iter() {
-        let r = best_compilations(policy_cache, subs[1].1.as_ref(), rw * sat_prob, *dissat_prob)?;
-        r_comp.push(r);
-    }
-
-    let mut insert_binary = |left: &BTreeMap<_, _>,
-                             right: &BTreeMap<_, _>,
-                             lw: PositiveF64,
-                             rw: PositiveF64,
-                             combinator: fn(&_, &_, _, _) -> Result<_, _>|
-     -> Result<(), CompilerError> {
-        for l in left.values() {
-            for r in right.values() {
-                if let Ok(new_ext) = combinator(l, r, lw, rw) {
-                    insert_best_wrapped(policy_cache, policy, ret, new_ext, sat_prob, dissat_prob)?;
-                }
+    for (branch, other, lw, rw) in [
+        (subs[0].1, subs[1].1, lw, rw),
+        (subs[1].1, subs[0].1, rw, lw),
+    ] {
+        if let PolicyNode::And(children) = &nodes[branch] {
+            let sp = lw * sat_prob;
+            let dp = Some((rw * sat_prob).conditional_add(dissat_prob));
+            let c = cached_compilations(policy_cache, other, rw * sat_prob, dissat_prob);
+            for (a, b) in [(children[0], children[1]), (children[1], children[0])] {
+                let a = cached_compilations(policy_cache, a, sp, dp);
+                let b = cached_compilations(policy_cache, b, sp, None);
+                insert_ternary(a, b, c, lw, rw);
             }
         }
-        Ok(())
-    };
+    }
 
-    insert_binary(&l_comp[0], &r_comp[0], lw, rw, AstElemExt::or_b)?;
-    insert_binary(&r_comp[0], &l_comp[0], rw, lw, AstElemExt::or_b)?;
-    insert_binary(&l_comp[0], &r_comp[2], lw, rw, AstElemExt::or_d)?;
-    insert_binary(&r_comp[0], &l_comp[2], rw, lw, AstElemExt::or_d)?;
-    insert_binary(&l_comp[1], &r_comp[3], lw, rw, AstElemExt::or_c)?;
-    insert_binary(&r_comp[1], &l_comp[3], rw, lw, AstElemExt::or_c)?;
-    insert_binary(&l_comp[2], &r_comp[3], lw, rw, AstElemExt::or_i)?;
-    insert_binary(&r_comp[2], &l_comp[3], rw, lw, AstElemExt::or_i)?;
-    insert_binary(&l_comp[3], &r_comp[2], lw, rw, AstElemExt::or_i)?;
-    insert_binary(&r_comp[3], &l_comp[2], rw, lw, AstElemExt::or_i)?;
+    let l_comp = or_dissat_probs(rw, sat_prob, dissat_prob)
+        .map(|dp| cached_compilations(policy_cache, subs[0].1, lw * sat_prob, dp));
+    let r_comp = or_dissat_probs(lw, sat_prob, dissat_prob)
+        .map(|dp| cached_compilations(policy_cache, subs[1].1, rw * sat_prob, dp));
 
-    Ok(())
+    let mut insert_binary =
+        |left: &BTreeMap<_, _>,
+         right: &BTreeMap<_, _>,
+         lw: PositiveF64,
+         rw: PositiveF64,
+         combinator: fn(&_, &_, _, _) -> Result<_, _>| {
+            for l in left.values() {
+                for r in right.values() {
+                    if let Ok(new_ext) = combinator(l, r, lw, rw) {
+                        insert_best_wrapped(policy_cache, task, ret, new_ext);
+                    }
+                }
+            }
+        };
+
+    insert_binary(l_comp[0], r_comp[0], lw, rw, AstElemExt::or_b);
+    insert_binary(r_comp[0], l_comp[0], rw, lw, AstElemExt::or_b);
+    insert_binary(l_comp[0], r_comp[2], lw, rw, AstElemExt::or_d);
+    insert_binary(r_comp[0], l_comp[2], rw, lw, AstElemExt::or_d);
+    insert_binary(l_comp[1], r_comp[3], lw, rw, AstElemExt::or_c);
+    insert_binary(r_comp[1], l_comp[3], rw, lw, AstElemExt::or_c);
+    insert_binary(l_comp[2], r_comp[3], lw, rw, AstElemExt::or_i);
+    insert_binary(r_comp[2], l_comp[3], rw, lw, AstElemExt::or_i);
+    insert_binary(l_comp[3], r_comp[2], lw, rw, AstElemExt::or_i);
+    insert_binary(r_comp[3], l_comp[2], rw, lw, AstElemExt::or_i);
 }
 
 #[cfg(feature = "std")]
@@ -887,118 +841,136 @@ fn insert_elem_closure<Pk: MiniscriptKey, Ctx: ScriptContext>(
 /// apply the wrappers around the element once and bring them into the same
 /// dissat probability map and get their closure.
 fn insert_best_wrapped<Pk: MiniscriptKey, Ctx: ScriptContext>(
-    policy_cache: &mut PolicyCache<Pk, Ctx>,
-    policy: &Concrete<Pk>,
+    policy_cache: &PolicyCache<Pk, Ctx>,
+    task: CompilationTask,
     map: &mut BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>,
     data: AstElemExt<Pk, Ctx>,
-    sat_prob: PositiveF64,
-    dissat_prob: Option<PositiveF64>,
-) -> Result<(), CompilerError> {
+) {
+    let CompilationTask { policy, sat_prob, dissat_prob } = task;
     insert_elem_closure(map, data, sat_prob, dissat_prob);
 
     if dissat_prob.is_some() {
         let casts: [Cast<Pk, Ctx>; 10] = all_casts::<Pk, Ctx>();
-
+        let inner = cached_compilations(policy_cache, policy, sat_prob, None);
         for c in &casts {
-            for x in best_compilations(policy_cache, policy, sat_prob, None)?.values() {
+            for x in inner.values() {
                 if let Ok(new_ext) = c.cast(x) {
                     insert_elem_closure(map, new_ext, sat_prob, dissat_prob);
                 }
             }
         }
     }
-    Ok(())
 }
 
-/// Get the best compilations of a policy with a given sat and dissat
-/// probabilities. This functions caches the results into a global policy cache.
-fn best_compilations<Pk, Ctx>(
-    policy_cache: &mut PolicyCache<Pk, Ctx>,
+/// Compile dependencies before their parents using a heap-allocated work stack.
+fn best_compilations<Pk: MiniscriptKey, Ctx: ScriptContext>(
     policy: &Concrete<Pk>,
     sat_prob: PositiveF64,
     dissat_prob: Option<PositiveF64>,
-) -> Result<BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>, CompilerError>
-where
-    Pk: MiniscriptKey,
-    Ctx: ScriptContext,
-{
-    //Check the cache for hits
-    if let Some(ret) = policy_cache.get(&(policy.clone(), sat_prob, dissat_prob)) {
-        return Ok(ret.clone());
+) -> Result<BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>, CompilerError> {
+    let (nodes, root) = flatten_policy(policy);
+    let root = CompilationTask::new(root, sat_prob, dissat_prob);
+    let mut policy_cache = PolicyCache::new();
+    let mut pending = vec![(root, false)];
+    let result: Result<_, CompilerError> = (|| {
+        while let Some((task, ready)) = pending.pop() {
+            if policy_cache.contains_key(&task) {
+                continue;
+            }
+            if ready {
+                let compilations = compile_task(&policy_cache, &nodes, task)?;
+                policy_cache.insert(task, compilations);
+            } else {
+                pending.push((task, true));
+                let first_dependency = pending.len();
+                task.for_each_dependency(&nodes, |dependency| pending.push((dependency, false)));
+                pending[first_dependency..].reverse();
+            }
+        }
+        Ok(policy_cache
+            .remove(&root)
+            .expect("root compilation was completed"))
+    })();
+    // Parents have larger node indices than their children. Drop their cached
+    // Miniscripts first, while child caches still own the shared subexpressions.
+    for (_, compilations) in policy_cache.into_iter().rev() {
+        drop(compilations);
     }
+    result
+}
 
+/// Compile one task using only results already computed by the work loop.
+fn compile_task<Pk: MiniscriptKey, Ctx: ScriptContext>(
+    policy_cache: &PolicyCache<Pk, Ctx>,
+    nodes: &[PolicyNode<'_, Pk>],
+    task: CompilationTask,
+) -> Result<BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>, CompilerError> {
+    let CompilationTask { policy, sat_prob, dissat_prob } = task;
     let mut ret = BTreeMap::new();
 
     //handy macro for good looking code
     macro_rules! insert_wrap {
         ($x:expr) => {
-            insert_best_wrapped(policy_cache, policy, &mut ret, $x, sat_prob, dissat_prob)?
+            insert_best_wrapped(policy_cache, task, &mut ret, $x)
         };
     }
 
-    match *policy {
-        Concrete::Unsatisfiable => {
-            insert_wrap!(AstElemExt::unsatisfiable());
-        }
-        Concrete::Trivial => {
-            insert_wrap!(AstElemExt::trivial());
-        }
-        Concrete::Key(ref pk) => {
-            insert_wrap!(AstElemExt::pk_h(pk.clone()));
-            insert_wrap!(AstElemExt::pk_k(pk.clone()));
-        }
-        Concrete::After(n) => insert_wrap!(AstElemExt::after(n)),
-        Concrete::Older(n) => insert_wrap!(AstElemExt::older(n)),
-        Concrete::Sha256(ref hash) => insert_wrap!(AstElemExt::sha256(hash.clone())),
-        // Satisfaction-cost + script-cost
-        Concrete::Hash256(ref hash) => insert_wrap!(AstElemExt::hash256(hash.clone())),
-        Concrete::Ripemd160(ref hash) => insert_wrap!(AstElemExt::ripemd160(hash.clone())),
-        Concrete::Hash160(ref hash) => insert_wrap!(AstElemExt::hash160(hash.clone())),
-        Concrete::And(ref subs) => {
-            assert_eq!(subs.len(), 2, "and takes 2 args");
-            let left = best_compilations(policy_cache, subs[0].as_ref(), sat_prob, dissat_prob)?;
-            let right = best_compilations(policy_cache, subs[1].as_ref(), sat_prob, dissat_prob)?;
-            let q_zero_right = best_compilations(policy_cache, subs[1].as_ref(), sat_prob, None)?;
-            let q_zero_left = best_compilations(policy_cache, subs[0].as_ref(), sat_prob, None)?;
+    match &nodes[policy] {
+        PolicyNode::Atom(atom) => match **atom {
+            Concrete::Unsatisfiable => {
+                insert_wrap!(AstElemExt::unsatisfiable());
+            }
+            Concrete::Trivial => {
+                insert_wrap!(AstElemExt::trivial());
+            }
+            Concrete::Key(ref pk) => {
+                insert_wrap!(AstElemExt::pk_h(pk.clone()));
+                insert_wrap!(AstElemExt::pk_k(pk.clone()));
+            }
+            Concrete::After(n) => insert_wrap!(AstElemExt::after(n)),
+            Concrete::Older(n) => insert_wrap!(AstElemExt::older(n)),
+            Concrete::Sha256(ref hash) => insert_wrap!(AstElemExt::sha256(hash.clone())),
+            // Satisfaction-cost + script-cost
+            Concrete::Hash256(ref hash) => insert_wrap!(AstElemExt::hash256(hash.clone())),
+            Concrete::Ripemd160(ref hash) => insert_wrap!(AstElemExt::ripemd160(hash.clone())),
+            Concrete::Hash160(ref hash) => insert_wrap!(AstElemExt::hash160(hash.clone())),
+            _ => unreachable!("only atomic policies are stored by reference"),
+        },
+        PolicyNode::And(subs) => {
+            let left = cached_compilations(policy_cache, subs[0], sat_prob, dissat_prob);
+            let right = cached_compilations(policy_cache, subs[1], sat_prob, dissat_prob);
+            let q_zero_right = cached_compilations(policy_cache, subs[1], sat_prob, None);
+            let q_zero_left = cached_compilations(policy_cache, subs[0], sat_prob, None);
 
-            let mut insert_binary = |left: &BTreeMap<_, _>,
-                                     right: &BTreeMap<_, _>,
-                                     combinator: fn(&_, &_) -> Result<_, _>|
-             -> Result<(), CompilerError> {
-                for l in left.values() {
-                    for r in right.values() {
-                        if let Ok(new_ext) = combinator(l, r) {
-                            insert_best_wrapped(
-                                policy_cache,
-                                policy,
-                                &mut ret,
-                                new_ext,
-                                sat_prob,
-                                dissat_prob,
-                            )?;
+            let mut insert_binary =
+                |left: &BTreeMap<_, _>,
+                 right: &BTreeMap<_, _>,
+                 combinator: fn(&_, &_) -> Result<_, _>| {
+                    for l in left.values() {
+                        for r in right.values() {
+                            if let Ok(new_ext) = combinator(l, r) {
+                                insert_best_wrapped(policy_cache, task, &mut ret, new_ext);
+                            }
                         }
                     }
-                }
-                Ok(())
-            };
-            insert_binary(&left, &right, AstElemExt::and_b)?;
+                };
+            insert_binary(left, right, AstElemExt::and_b);
             // Do a separate loop with 'l' and 'r' swapped; we could combine the loops,
             // but this would sometimes result in compiling e.g. and(pk(A),pk(B)) into
             // an and with A and B swapped, which is surprising to the user since the
             // cost is the same with or without the swap.
-            insert_binary(&right, &left, AstElemExt::and_b)?;
-            insert_binary(&left, &right, AstElemExt::and_v)?;
-            insert_binary(&right, &left, AstElemExt::and_v)?;
-            insert_binary(&left, &q_zero_right, AstElemExt::and_n)?;
-            insert_binary(&right, &q_zero_left, AstElemExt::and_n)?;
+            insert_binary(right, left, AstElemExt::and_b);
+            insert_binary(left, right, AstElemExt::and_v);
+            insert_binary(right, left, AstElemExt::and_v);
+            insert_binary(left, q_zero_right, AstElemExt::and_n);
+            insert_binary(right, q_zero_left, AstElemExt::and_n);
         }
-        Concrete::Or(ref subs) => {
-            best_compilations_or(&mut ret, policy_cache, policy, subs, sat_prob, dissat_prob)?;
+        PolicyNode::Or(subs) => {
+            best_compilations_or(&mut ret, policy_cache, nodes, task, subs);
         }
-        Concrete::Thresh(ref thresh) => {
+        PolicyNode::Thresh { children: thresh, conjunction } => {
             let k = thresh.k();
             let n = thresh.n();
-            let k_over_n = PositiveF64::k_over_n(thresh);
 
             let mut sub_ext_data = Vec::with_capacity(n);
 
@@ -1007,21 +979,15 @@ where
 
             let mut min_value = (0, f64::INFINITY);
 
-            let total_sat_prob = sat_prob * k_over_n;
-            // This match can be written in terms of nested conditional_adds() but seems less clear that way.
-            let total_dissat_prob = match (dissat_prob, PositiveF64::one_minus_k_over_n(thresh)) {
-                (Some(dp), Some(kn)) => Some(dp + kn * sat_prob),
-                (Some(dp), None) => Some(dp),
-                (None, Some(kn)) => Some(kn * sat_prob),
-                (None, None) => None,
-            };
+            let (total_sat_prob, total_dissat_prob) =
+                threshold_probs(thresh, sat_prob, dissat_prob);
 
             for (i, ast) in thresh.iter().enumerate() {
                 let sp = total_sat_prob;
                 let dp = total_dissat_prob;
 
-                let be = best(types::Base::B, policy_cache, ast.as_ref(), sp, dp)?;
-                let bw = best(types::Base::W, policy_cache, ast.as_ref(), sp, dp)?;
+                let be = best(types::Base::B, policy_cache, *ast, sp, dp)?;
+                let bw = best(types::Base::W, policy_cache, *ast, sp, dp)?;
 
                 let diff = be.cost_1d(sp, dp) - bw.cost_1d(sp, dp);
                 best_es.push((be.comp_ext_data, be));
@@ -1065,11 +1031,11 @@ where
 
             let key_count = thresh
                 .iter()
-                .filter(|s| matches!(***s, Concrete::Key(_)))
+                .filter(|&&id| matches!(nodes[id], PolicyNode::Atom(Concrete::Key(_))))
                 .count();
             if key_count == thresh.n() {
                 let pk_thresh = thresh.map_ref(|s| {
-                    if let Concrete::Key(ref pk) = **s {
+                    if let PolicyNode::Atom(Concrete::Key(pk)) = &nodes[*s] {
                         Pk::clone(pk)
                     } else {
                         unreachable!()
@@ -1088,12 +1054,9 @@ where
                     }
                 }
             }
-            if thresh.is_and() {
-                let mut it = thresh.iter();
-                let mut policy = it.next().expect("No sub policy in thresh() ?").clone();
-                policy = it.fold(policy, |acc, pol| Concrete::And(vec![acc, pol.clone()]).into());
-
-                ret = best_compilations(policy_cache, policy.as_ref(), sat_prob, dissat_prob)?;
+            if let Some(conjunction) = conjunction {
+                ret =
+                    cached_compilations(policy_cache, *conjunction, sat_prob, dissat_prob).clone();
             }
 
             // FIXME: Should we also special-case thresh.is_or() ?
@@ -1111,7 +1074,6 @@ where
         // before calling this compile function
         Err(CompilerError::LimitsExceeded)
     } else {
-        policy_cache.insert((policy.clone(), sat_prob, dissat_prob), ret.clone());
         Ok(ret)
     }
 }
@@ -1120,20 +1082,19 @@ where
 pub fn best_compilation<Pk: MiniscriptKey, Ctx: ScriptContext>(
     policy: &Concrete<Pk>,
 ) -> Result<Miniscript<Pk, Ctx>, CompilerError> {
-    let mut policy_cache = PolicyCache::<Pk, Ctx>::new();
-    let x = &*best_t(&mut policy_cache, policy, PositiveF64::ONE, None)?.ms;
-    if !x.ty.mall.signed {
+    let x = best_t(policy, PositiveF64::ONE, None)?;
+    if !x.ms.ty.mall.signed {
         Err(CompilerError::TopLevelSigless)
-    } else if !x.ty.mall.non_malleable {
+    } else if !x.ms.ty.mall.non_malleable {
         Err(CompilerError::ImpossibleNonMalleableCompilation)
     } else {
-        Ok(x.clone())
+        // The cache and competing compilations have been dropped, so the root is uniquely owned.
+        Ok(Arc::try_unwrap(x.ms).expect("only the selected compilation remains"))
     }
 }
 
 /// Obtain the best B expression with given sat and dissat
 fn best_t<Pk, Ctx>(
-    policy_cache: &mut PolicyCache<Pk, Ctx>,
     policy: &Concrete<Pk>,
     sat_prob: PositiveF64,
     dissat_prob: Option<PositiveF64>,
@@ -1142,7 +1103,7 @@ where
     Pk: MiniscriptKey,
     Ctx: ScriptContext,
 {
-    best_compilations(policy_cache, policy, sat_prob, dissat_prob)?
+    best_compilations(policy, sat_prob, dissat_prob)?
         .into_iter()
         .filter(|&(key, _)| key.ty.corr.base == types::Base::B && key.dissat_prob == dissat_prob)
         .map(|(_, val)| val)
@@ -1153,8 +1114,8 @@ where
 /// Obtain the <basic-type>.deu (e.g. W.deu, B.deu) expression with the given sat and dissat
 fn best<Pk, Ctx>(
     basic_type: types::Base,
-    policy_cache: &mut PolicyCache<Pk, Ctx>,
-    policy: &Concrete<Pk>,
+    policy_cache: &PolicyCache<Pk, Ctx>,
+    policy: usize,
     sat_prob: PositiveF64,
     dissat_prob: Option<PositiveF64>,
 ) -> Result<AstElemExt<Pk, Ctx>, CompilerError>
@@ -1162,8 +1123,8 @@ where
     Pk: MiniscriptKey,
     Ctx: ScriptContext,
 {
-    best_compilations(policy_cache, policy, sat_prob, dissat_prob)?
-        .into_iter()
+    cached_compilations(policy_cache, policy, sat_prob, dissat_prob)
+        .iter()
         .filter(|(key, val)| {
             key.ty.corr.base == basic_type
                 && key.ty.corr.unit
@@ -1172,6 +1133,7 @@ where
         })
         .map(|(_, val)| val)
         .min_by_key(|ext| PositiveF64::new(ext.cost_1d(sat_prob, dissat_prob)))
+        .cloned()
         .ok_or(CompilerError::LimitsExceeded)
 }
 
@@ -1277,8 +1239,7 @@ mod tests {
     #[test]
     fn compile_q() {
         let policy = SPolicy::from_str("or(1@and(pk(A),pk(B)),127@pk(C))").expect("parsing");
-        let compilation: TapAstElemExt =
-            best_t(&mut BTreeMap::new(), &policy, PositiveF64::ONE, None).unwrap();
+        let compilation: TapAstElemExt = best_t(&policy, PositiveF64::ONE, None).unwrap();
 
         assert_eq!(compilation.cost_1d(PositiveF64::ONE, None), 87.0 + 67.0390625);
         assert_eq!(policy.lift().unwrap().sorted(), compilation.ms.lift().unwrap().sorted());
@@ -1287,8 +1248,7 @@ mod tests {
         let policy = SPolicy::from_str(
                 "and(and(and(or(127@thresh(2,pk(A),pk(B),thresh(2,or(127@pk(A),1@pk(B)),after(100),or(and(pk(C),after(200)),and(pk(D),sha256(66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925))),pk(E))),1@pk(F)),sha256(66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925)),or(127@pk(G),1@after(300))),or(127@after(400),pk(H)))"
             ).expect("parsing");
-        let compilation: TapAstElemExt =
-            best_t(&mut BTreeMap::new(), &policy, PositiveF64::ONE, None).unwrap();
+        let compilation: TapAstElemExt = best_t(&policy, PositiveF64::ONE, None).unwrap();
 
         assert_eq!(compilation.cost_1d(PositiveF64::ONE, None), 433.0 + 275.7909749348958);
         assert_eq!(policy.lift().unwrap().sorted(), compilation.ms.lift().unwrap().sorted());
@@ -1444,6 +1404,85 @@ mod tests {
                 vec![],
             ]
         );
+    }
+
+    #[cfg(feature = "std")]
+    fn compile_chain_on_small_stack(
+        depth: usize,
+        extend: impl Fn(Arc<SPolicy>, usize) -> SPolicy,
+    ) -> Result<Miniscript<String, Segwitv0>, CompilerError> {
+        // Retain each prefix so constructing and dropping the input do not test
+        // the recursive destructor of Concrete instead of the compiler.
+        let mut prefixes = vec![Arc::new(SPolicy::Key("A".to_string()))];
+        for i in 0..depth {
+            prefixes.push(Arc::new(extend(Arc::clone(prefixes.last().unwrap()), i)));
+        }
+        let policy = Arc::clone(prefixes.last().unwrap());
+        let result = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || policy.compile())
+            .unwrap()
+            .join()
+            .unwrap();
+        while prefixes.pop().is_some() {}
+        result
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn compile_deep_and() {
+        let result = compile_chain_on_small_stack(2048, |left, i| {
+            SPolicy::And(vec![left, Arc::new(SPolicy::Key(format!("K{}", i)))])
+        });
+        assert_eq!(result, Err(CompilerError::LimitsExceeded));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn compile_deep_threshold() {
+        let result = compile_chain_on_small_stack(2048, |child, _| {
+            SPolicy::Thresh(Threshold::new(1, vec![child]).unwrap())
+        });
+        assert_eq!(result.unwrap().to_string(), "pk(A)");
+    }
+
+    #[test]
+    fn compile_and_threshold_preserves_compilations() {
+        fn check<Ctx: ScriptContext>() {
+            for (threshold, conjunction) in [
+                ("thresh(1,pk(A))", "pk(A)"),
+                ("thresh(2,pk(A),pk(B))", "and(pk(A),pk(B))"),
+                (
+                    "thresh(3,pk(A),or(3@pk(B),2@pk(C)),and(pk(D),older(10)))",
+                    "and(and(pk(A),or(3@pk(B),2@pk(C))),and(pk(D),older(10)))",
+                ),
+            ] {
+                let threshold = SPolicy::from_str(threshold).unwrap();
+                let conjunction = SPolicy::from_str(conjunction).unwrap();
+                for sat_prob in [PositiveF64::ONE, PositiveF64::ONE_QUARTER] {
+                    for dissat_prob in [None, Some(PositiveF64::ONE_QUARTER)] {
+                        let compile = |policy| {
+                            best_compilations::<_, Ctx>(policy, sat_prob, dissat_prob)
+                                .unwrap()
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key,
+                                        value.ms.to_string(),
+                                        value.comp_ext_data.sat_cost,
+                                        value.comp_ext_data.dissat_cost,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(compile(&threshold), compile(&conjunction));
+                    }
+                }
+            }
+        }
+
+        check::<Segwitv0>();
+        check::<Tap>();
     }
 
     #[test]

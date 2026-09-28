@@ -42,8 +42,8 @@ pub(super) fn flatten_policy<Pk: MiniscriptKey>(
     let mut nodes = Vec::new();
     let mut indices = BTreeMap::new();
     let mut stack = Vec::new();
-    // Reverse preorder visits children before their parent, with the leftmost child
-    // on top of the stack. The preorder iterator itself uses an explicit stack.
+    // Reverse preorder visits children before parents and leaves the leftmost
+    // child's index on top of the stack.
     for policy in policy
         .pre_order_iter()
         .collect::<Vec<_>>()
@@ -84,7 +84,7 @@ pub(super) fn flatten_policy<Pk: MiniscriptKey>(
     (nodes, stack.pop().unwrap())
 }
 
-/// A policy may need several compilations with different satisfaction costs.
+/// A policy compiled at given satisfaction and dissatisfaction probabilities.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CompilationTask {
     pub policy: usize,
@@ -97,8 +97,8 @@ impl CompilationTask {
         Self { policy, sat_prob, dissat_prob }
     }
 
-    /// Visit dependencies in evaluation order. A task with a dissatisfaction cost
-    /// first compiles the same policy without one, including its dependencies.
+    /// Visit dependencies in evaluation order. Tasks with `dissat_prob = Some(_)`
+    /// depend on the same policy compiled with `dissat_prob = None`.
     pub fn for_each_dependency<Pk: MiniscriptKey>(
         self,
         nodes: &[PolicyNode<'_, Pk>],
@@ -131,7 +131,7 @@ impl CompilationTask {
                     }
                 }
                 for (child, weight, other_weight) in [(subs[0].1, lw, rw), (subs[1].1, rw, lw)] {
-                    // Each Some task also compiles None, so it need not be queued separately.
+                    // Each Some task includes its None dependency.
                     for dp in or_dissat_probs(other_weight, sat_prob, dissat_prob)
                         .into_iter()
                         .flatten()

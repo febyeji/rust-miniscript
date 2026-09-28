@@ -5,6 +5,7 @@
 //! Optimizing compiler from concrete policies to Miniscript
 //!
 
+mod ms;
 mod work;
 
 use core::num::NonZeroU32;
@@ -14,6 +15,7 @@ use std::error;
 
 use sync::Arc;
 
+use self::ms::CompilerMiniscript;
 use self::work::{
     flatten_policy, or_dissat_probs, or_weights, threshold_probs, CompilationTask, PolicyNode,
 };
@@ -428,7 +430,7 @@ impl CompilerExtData {
 #[derive(Clone, Debug)]
 struct AstElemExt<Pk: MiniscriptKey, Ctx: ScriptContext> {
     /// The actual Miniscript fragment with type information
-    ms: Arc<Miniscript<Pk, Ctx>>,
+    ms: CompilerMiniscript<Pk, Ctx>,
     /// Its "type" in terms of compiler data
     comp_ext_data: CompilerExtData,
 }
@@ -451,55 +453,79 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> AstElemExt<Pk, Ctx> {
 
 impl<Pk: MiniscriptKey, Ctx: ScriptContext> AstElemExt<Pk, Ctx> {
     fn unsatisfiable() -> Self {
-        Self { ms: Arc::new(Miniscript::FALSE), comp_ext_data: CompilerExtData::FALSE }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::FALSE),
+            comp_ext_data: CompilerExtData::FALSE,
+        }
     }
 
     fn trivial() -> Self {
-        Self { ms: Arc::new(Miniscript::TRUE), comp_ext_data: CompilerExtData::TRUE }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::TRUE),
+            comp_ext_data: CompilerExtData::TRUE,
+        }
     }
 
     fn pk_h(key: Pk) -> Self {
         Self {
-            ms: Arc::new(Miniscript::pk_h(key)),
+            ms: CompilerMiniscript::new(Miniscript::pk_h(key)),
             comp_ext_data: CompilerExtData::pk_h::<Ctx>(),
         }
     }
 
     fn pk_k(key: Pk) -> Self {
         Self {
-            ms: Arc::new(Miniscript::pk_k(key)),
+            ms: CompilerMiniscript::new(Miniscript::pk_k(key)),
             comp_ext_data: CompilerExtData::pk_k::<Ctx>(),
         }
     }
 
     fn after(t: crate::AbsLockTime) -> Self {
-        Self { ms: Arc::new(Miniscript::after(t)), comp_ext_data: CompilerExtData::time() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::after(t)),
+            comp_ext_data: CompilerExtData::time(),
+        }
     }
 
     fn older(t: crate::RelLockTime) -> Self {
-        Self { ms: Arc::new(Miniscript::older(t)), comp_ext_data: CompilerExtData::time() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::older(t)),
+            comp_ext_data: CompilerExtData::time(),
+        }
     }
 
     fn sha256(h: Pk::Sha256) -> Self {
-        Self { ms: Arc::new(Miniscript::sha256(h)), comp_ext_data: CompilerExtData::hash() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::sha256(h)),
+            comp_ext_data: CompilerExtData::hash(),
+        }
     }
 
     fn hash256(h: Pk::Hash256) -> Self {
-        Self { ms: Arc::new(Miniscript::hash256(h)), comp_ext_data: CompilerExtData::hash() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::hash256(h)),
+            comp_ext_data: CompilerExtData::hash(),
+        }
     }
 
     fn ripemd160(h: Pk::Ripemd160) -> Self {
-        Self { ms: Arc::new(Miniscript::ripemd160(h)), comp_ext_data: CompilerExtData::hash() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::ripemd160(h)),
+            comp_ext_data: CompilerExtData::hash(),
+        }
     }
 
     fn hash160(h: Pk::Hash160) -> Self {
-        Self { ms: Arc::new(Miniscript::hash160(h)), comp_ext_data: CompilerExtData::hash() }
+        Self {
+            ms: CompilerMiniscript::new(Miniscript::hash160(h)),
+            comp_ext_data: CompilerExtData::hash(),
+        }
     }
 
     fn multi(thresh: crate::Threshold<Pk, MAX_PUBKEYS_PER_MULTISIG>) -> Self {
         let k = thresh.k();
         Self {
-            ms: Arc::new(Miniscript::multi(thresh)),
+            ms: CompilerMiniscript::new(Miniscript::multi(thresh)),
             comp_ext_data: CompilerExtData::multi(k),
         }
     }
@@ -508,7 +534,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> AstElemExt<Pk, Ctx> {
         let k = thresh.k();
         let n = thresh.n();
         Self {
-            ms: Arc::new(Miniscript::multi_a(thresh)),
+            ms: CompilerMiniscript::new(Miniscript::multi_a(thresh)),
             comp_ext_data: CompilerExtData::multi_a(k, n),
         }
     }
@@ -517,10 +543,10 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> AstElemExt<Pk, Ctx> {
     /// by construction that all validation parameters are upheld.
     fn compose_typeck_only(
         term: Terminal<Pk, Ctx>,
-    ) -> Result<Arc<Miniscript<Pk, Ctx>>, types::Error> {
+    ) -> Result<CompilerMiniscript<Pk, Ctx>, types::Error> {
         let ty = types::Type::type_check(&term)?;
         let ext = types::ExtData::type_check(&term);
-        Ok(Arc::new(Miniscript::from_components_unchecked(term, ty, ext)))
+        Ok(CompilerMiniscript::new(Miniscript::from_components_unchecked(term, ty, ext)))
     }
 
     fn and_b(left: &Self, right: &Self) -> Result<Self, types::Error> {
@@ -672,7 +698,7 @@ struct Cast<Pk: MiniscriptKey, Ctx: ScriptContext> {
 impl<Pk: MiniscriptKey, Ctx: ScriptContext> Cast<Pk, Ctx> {
     fn cast(&self, ast: &AstElemExt<Pk, Ctx>) -> Result<AstElemExt<Pk, Ctx>, ErrorKind> {
         Ok(AstElemExt {
-            ms: Arc::new(Miniscript::from_components_unchecked(
+            ms: CompilerMiniscript::new(Miniscript::from_components_unchecked(
                 (self.node)(Arc::clone(&ast.ms)),
                 (self.ast_type)(ast.ms.ty)?,
                 (self.ext_data)(ast.ms.ext),
@@ -862,7 +888,7 @@ fn insert_best_wrapped<Pk: MiniscriptKey, Ctx: ScriptContext>(
     }
 }
 
-/// Compile dependencies before their parents using a heap-allocated work stack.
+/// Compile each task after its dependencies using a work stack.
 fn best_compilations<Pk: MiniscriptKey, Ctx: ScriptContext>(
     policy: &Concrete<Pk>,
     sat_prob: PositiveF64,
@@ -899,7 +925,7 @@ fn best_compilations<Pk: MiniscriptKey, Ctx: ScriptContext>(
     result
 }
 
-/// Compile one task using only results already computed by the work loop.
+/// Compile a task from its cached dependencies.
 fn compile_task<Pk: MiniscriptKey, Ctx: ScriptContext>(
     policy_cache: &PolicyCache<Pk, Ctx>,
     nodes: &[PolicyNode<'_, Pk>],
@@ -1023,7 +1049,7 @@ fn compile_task<Pk: MiniscriptKey, Ctx: ScriptContext>(
 
             if let Ok(ms) = Miniscript::from_ast(ast) {
                 let ast_ext = AstElemExt {
-                    ms: Arc::new(ms),
+                    ms: CompilerMiniscript::new(ms),
                     comp_ext_data: CompilerExtData::threshold(k, n, |i| sub_ext_data[i]),
                 };
                 insert_wrap!(ast_ext);
@@ -1079,6 +1105,9 @@ fn compile_task<Pk: MiniscriptKey, Ctx: ScriptContext>(
 }
 
 /// Obtain the best compilation of for p=1.0 and q=0
+///
+/// Compilation and cleanup of temporary Miniscripts use explicit stacks.
+/// Dropping the input policy or returned Miniscript still recurses.
 pub fn best_compilation<Pk: MiniscriptKey, Ctx: ScriptContext>(
     policy: &Concrete<Pk>,
 ) -> Result<Miniscript<Pk, Ctx>, CompilerError> {
@@ -1091,8 +1120,8 @@ pub fn best_compilation<Pk: MiniscriptKey, Ctx: ScriptContext>(
             Err(CompilerError::TopLevelSigless)
         }
         types::Malleability::NonMalleable { .. } => {
-            // The cache and competing compilations have been dropped, so the root is uniquely owned.
-            Ok(Arc::try_unwrap(x.ms).expect("only the selected compilation remains"))
+            // The cache and other candidates are gone, leaving one owner of the root.
+            Ok(x.ms.into_inner())
         }
     }
 }
@@ -1411,12 +1440,11 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn compile_chain_on_small_stack(
+    fn compile_chain_on_small_stack<Ctx: ScriptContext + Send + Sync>(
         depth: usize,
         extend: impl Fn(Arc<SPolicy>, usize) -> SPolicy,
-    ) -> Result<Miniscript<String, Segwitv0>, CompilerError> {
-        // Retain each prefix so constructing and dropping the input do not test
-        // the recursive destructor of Concrete instead of the compiler.
+    ) -> Result<Miniscript<String, Ctx>, CompilerError> {
+        // Holding each prefix keeps input destruction off the small-stack thread.
         let mut prefixes = vec![Arc::new(SPolicy::Key("A".to_string()))];
         for i in 0..depth {
             prefixes.push(Arc::new(extend(Arc::clone(prefixes.last().unwrap()), i)));
@@ -1435,7 +1463,7 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn compile_deep_and() {
-        let result = compile_chain_on_small_stack(2048, |left, i| {
+        let result = compile_chain_on_small_stack::<Segwitv0>(2048, |left, i| {
             SPolicy::And(vec![left, Arc::new(SPolicy::Key(format!("K{}", i)))])
         });
         assert_eq!(result, Err(CompilerError::LimitsExceeded));
@@ -1444,10 +1472,23 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn compile_deep_threshold() {
-        let result = compile_chain_on_small_stack(2048, |child, _| {
+        let result = compile_chain_on_small_stack::<Segwitv0>(2048, |child, _| {
             SPolicy::Thresh(Threshold::new(1, vec![child]).unwrap())
         });
         assert_eq!(result.unwrap().to_string(), "pk(A)");
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn compile_deep_taproot_policy() {
+        let ms = compile_chain_on_small_stack::<Tap>(256, |child, _| {
+            SPolicy::And(vec![
+                child,
+                Arc::new(SPolicy::After(AbsLockTime::from_consensus(1).unwrap())),
+            ])
+        })
+        .unwrap();
+        assert!(ms.ext.tree_height >= 256);
     }
 
     #[test]

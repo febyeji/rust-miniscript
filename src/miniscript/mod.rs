@@ -1235,6 +1235,16 @@ mod tests {
     type Segwitv0Script = Miniscript<bitcoin::PublicKey, Segwitv0>;
     type Tapscript = Miniscript<bitcoin::secp256k1::XOnlyPublicKey, Tap>;
 
+    #[test]
+    fn move_public_node() {
+        let ms = Miniscript::<String, Tap>::pk_k("A".to_owned());
+        let node = ms.node;
+        match node {
+            Terminal::PkK(key) => assert_eq!(key, "A"),
+            _ => panic!("expected a key node"),
+        }
+    }
+
     fn pubkeys(n: usize) -> Vec<bitcoin::PublicKey> {
         let mut ret = Vec::with_capacity(n);
         let secp = secp256k1::Secp256k1::new();

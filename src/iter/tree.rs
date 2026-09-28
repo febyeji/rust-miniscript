@@ -176,9 +176,7 @@ impl<T: TreeLike> Iterator for PostOrderIter<T> {
         while !current.processed {
             current.processed = true;
 
-            // When we first encounter an item, it is completely unknown; it is
-            // nominally the next item to be yielded, but it might have children,
-            // and if so, they come first
+            // Push this node before its children so it is yielded after them.
             let current_stack_idx = self.stack.len();
             let n_children = current.elem.n_children();
             self.stack.push(current);
@@ -191,12 +189,7 @@ impl<T: TreeLike> Iterator for PostOrderIter<T> {
             current = self.stack.pop()?;
         }
 
-        // The second time we encounter an item, we have dealt with its children,
-        // updated the child indices for this item, and are now ready to yield it
-        // rather than putting it back in the stack.
-        //
-        // Before yielding though, we must update the item's parent's child indices with
-        // this item's index.
+        // All children have been yielded. Record this node's index in its parent.
         if let Some(idx) = current.parent_stack_idx {
             self.stack[idx].child_indices.push(self.index);
         }

@@ -57,6 +57,7 @@ mod private {
     use super::ScriptContext;
     use crate::iter::{StackExt as _, TreeLike as _};
     use crate::prelude::sync::Arc;
+    use crate::prelude::Vec;
     use crate::{
         AbsLockTime, Error, MiniscriptKey, RelLockTime, Terminal, ValidationError,
         ValidationParams, MAX_RECURSION_DEPTH,
@@ -65,6 +66,7 @@ mod private {
     /// The top-level miniscript abstract syntax tree (AST).
     pub struct Miniscript<Pk: MiniscriptKey, Ctx: ScriptContext> {
         /// A node in the AST.
+        /// Use [`Self::into_inner`] to take ownership of the node.
         pub node: Terminal<Pk, Ctx>,
         /// The correctness and malleability type information for the AST node.
         pub ty: types::Type,
@@ -72,6 +74,45 @@ mod private {
         pub ext: types::extra_props::ExtData,
         /// Context PhantomData. Only accessible inside this crate
         phantom: PhantomData<Ctx>,
+    }
+
+    impl<Pk: MiniscriptKey, Ctx: ScriptContext> Drop for Miniscript<Pk, Ctx> {
+        fn drop(&mut self) {
+            let mut pending = Vec::new();
+            // Detach each owned node before its children can be dropped recursively.
+            let mut node = core::mem::replace(&mut self.node, Terminal::False);
+            loop {
+                match node {
+                    Terminal::Alt(child)
+                    | Terminal::Swap(child)
+                    | Terminal::Check(child)
+                    | Terminal::DupIf(child)
+                    | Terminal::Verify(child)
+                    | Terminal::NonZero(child)
+                    | Terminal::ZeroNotEqual(child) => pending.push(child),
+                    Terminal::AndV(left, right)
+                    | Terminal::AndB(left, right)
+                    | Terminal::OrB(left, right)
+                    | Terminal::OrD(left, right)
+                    | Terminal::OrC(left, right)
+                    | Terminal::OrI(left, right) => pending.extend([right, left]),
+                    Terminal::AndOr(a, b, c) => pending.extend([c, b, a]),
+                    Terminal::Thresh(thresh) => {
+                        pending.extend(thresh.into_data().into_iter().rev())
+                    }
+                    leaf => drop(leaf),
+                }
+                let child = match pending.pop() {
+                    Some(child) => child,
+                    None => return,
+                };
+                // Shared children stay owned by their remaining references.
+                node = match Arc::try_unwrap(child) {
+                    Ok(mut child) => core::mem::replace(&mut child.node, Terminal::False),
+                    Err(_) => Terminal::False,
+                };
+            }
+        }
     }
 
     impl<Pk: MiniscriptKey, Ctx: ScriptContext> Clone for Miniscript<Pk, Ctx> {
@@ -514,7 +555,9 @@ pub use private::Miniscript;
 
 impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     /// Extracts the `AstElem` representing the root of the miniscript
-    pub fn into_inner(self) -> Terminal<Pk, Ctx> { self.node }
+    pub fn into_inner(mut self) -> Terminal<Pk, Ctx> {
+        core::mem::replace(&mut self.node, Terminal::False)
+    }
 
     /// Get a reference to the inner `AstElem` representing the root of miniscript
     pub fn as_inner(&self) -> &Terminal<Pk, Ctx> { &self.node }

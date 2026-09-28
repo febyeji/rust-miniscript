@@ -243,19 +243,22 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
         TapleafProbabilityIter { stack: vec![(PositiveF64::ONE, self)] }
     }
 
-    /// Extracts the internal_key from this policy tree.
+    /// Selects the most likely key spend from this policy tree.
     #[cfg(feature = "compiler")]
-    fn extract_key(self, unspendable_key: Option<Pk>) -> Result<(Pk, Self), CompilerError> {
-        let internal_key = self
-            .tapleaf_probability_iter()
+    fn internal_key(&self) -> Option<Pk> {
+        self.tapleaf_probability_iter()
             .filter_map(|(prob, ref pol)| match pol {
                 Self::Key(pk) => Some((prob, pk)),
                 _ => None,
             })
             .max_by_key(|(prob, _)| *prob)
-            .map(|(_, pk)| pk.clone());
+            .map(|(_, pk)| pk.clone())
+    }
 
-        match (internal_key, unspendable_key) {
+    /// Extracts the internal_key from this policy tree.
+    #[cfg(feature = "compiler")]
+    fn extract_key(self, unspendable_key: Option<Pk>) -> Result<(Pk, Self), CompilerError> {
+        match (self.internal_key(), unspendable_key) {
             (Some(ref key), _) => Ok((key.clone(), self.translate_unsatisfiable_pk(key))),
             (_, Some(key)) => Ok((key, self)),
             _ => Err(CompilerError::NoInternalKey),
@@ -287,18 +290,24 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             (false, _) => Err(CompilerError::TopLevelSigless),
             (_, false) => Err(CompilerError::ImpossibleNonMalleableCompilation),
             _ => {
-                let (internal_key, policy) = self.clone().extract_key(unspendable_key)?;
-                policy.check_num_tapleaves()?;
+                let selected_key = self.internal_key();
+                let internal_key = selected_key
+                    .clone()
+                    .or(unspendable_key)
+                    .ok_or(CompilerError::NoInternalKey)?;
+                self.check_num_tapleaves()?;
                 let tree = Descriptor::new_tr(
                     internal_key,
-                    match policy {
+                    match self {
                         Self::Trivial => None,
                         policy => {
                             let mut leaf_compilations: Vec<(PositiveF64, Miniscript<Pk, Tap>)> =
                                 vec![];
                             for (prob, pol) in policy.tapleaf_probability_iter() {
-                                // policy corresponding to the key (replaced by unsatisfiable) is skipped
-                                if *pol == Self::Unsatisfiable {
+                                // Skip the key-spend leaf without cloning and rewriting the policy.
+                                if *pol == Self::Unsatisfiable
+                                    || matches!(pol, Self::Key(pk) if Some(pk) == selected_key.as_ref())
+                                {
                                     continue;
                                 }
                                 let compilation = compiler::best_compilation::<Pk, Tap>(pol)?;
@@ -1310,6 +1319,29 @@ mod compiler_tests {
         assert!(policy.compile_tr(None).is_ok());
         assert!(policy.compile_tr_native(None, 1024).is_ok());
         assert!(policy.compile_tr_private_experimental(None).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn compile_tr_deep_threshold() {
+        // Keep the input prefixes alive to isolate the compiler's temporary policy cleanup.
+        let mut prefixes = vec![Arc::new(Policy::Key("A".to_owned()))];
+        for _ in 0..512 {
+            let child = Arc::clone(prefixes.last().unwrap());
+            prefixes.push(Arc::new(Policy::Thresh(Threshold::new(1, vec![child]).unwrap())));
+        }
+        let policy = Arc::clone(prefixes.last().unwrap());
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let descriptor = policy.compile_tr(Some("INTERNAL".to_owned())).unwrap();
+                assert_eq!(descriptor.to_string(), "tr(A)#xyg3grex");
+                drop(descriptor);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        while prefixes.pop().is_some() {}
     }
 
     #[test]

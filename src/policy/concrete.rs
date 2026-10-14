@@ -658,57 +658,107 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     /// separate sub-policies, producing IF-free leaves for Taptree-native compilation.
     #[cfg(feature = "compiler")]
     fn enumerate_pol_native(&self, prob: PositiveF64) -> PolicyExpansion<Pk> {
-        match self {
-            Self::Or(subs) => {
-                let normalized_iter = PositiveF64::normalized_iter(subs.iter().map(|x| x.0.into()));
-                PolicyExpansion {
-                    leaves: normalized_iter
-                        .zip(subs.iter())
-                        .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
-                        .collect(),
-                    expanded: true,
+        let expand = |policy: &Self, prob: PositiveF64| -> Option<PolicyExpansion<Pk>> {
+            match policy {
+                Self::Or(subs) => {
+                    let normalized_iter =
+                        PositiveF64::normalized_iter(subs.iter().map(|x| x.0.into()));
+                    Some(PolicyExpansion {
+                        leaves: normalized_iter
+                            .zip(subs.iter())
+                            .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
+                            .collect(),
+                        expanded: true,
+                    })
                 }
-            }
-            Self::Thresh(ref thresh) if thresh.is_or() => {
-                let total_odds = PositiveF64::n(thresh);
-                PolicyExpansion {
-                    leaves: thresh
-                        .iter()
-                        .map(|pol| (prob / total_odds, pol.clone()))
-                        .collect(),
-                    expanded: true,
-                }
-            }
-            Self::Thresh(ref thresh) if !thresh.is_and() => {
-                PolicyExpansion { leaves: generate_combination(thresh, prob), expanded: true }
-            }
-            Self::And(subs) => {
-                for (i, sub) in subs.iter().enumerate() {
-                    let child_expanded = sub.enumerate_pol_native(PositiveF64::ONE);
-                    if child_expanded.expanded {
-                        let other: Vec<_> = subs
+                Self::Thresh(ref thresh) if thresh.is_or() => {
+                    let total_odds = PositiveF64::n(thresh);
+                    Some(PolicyExpansion {
+                        leaves: thresh
                             .iter()
-                            .enumerate()
-                            .filter(|(j, _)| *j != i)
-                            .map(|(_, s)| s.clone())
-                            .collect();
-                        return PolicyExpansion {
-                            leaves: child_expanded
-                                .leaves
-                                .into_iter()
-                                .map(|(child_prob, child_pol)| {
-                                    let mut new_subs = other.clone();
-                                    new_subs.insert(i, child_pol);
-                                    (prob * child_prob, Arc::new(Self::And(new_subs)))
-                                })
-                                .collect(),
-                            expanded: true,
-                        };
-                    }
+                            .map(|pol| (prob / total_odds, pol.clone()))
+                            .collect(),
+                        expanded: true,
+                    })
                 }
-                PolicyExpansion { leaves: vec![(prob, Arc::new(self.clone()))], expanded: false }
+                Self::Thresh(ref thresh) if !thresh.is_and() => Some(PolicyExpansion {
+                    leaves: generate_combination(thresh, prob),
+                    expanded: true,
+                }),
+                _ => None,
             }
-            pol => PolicyExpansion { leaves: vec![(prob, Arc::new(pol.clone()))], expanded: false },
+        };
+
+        if let Some(expansion) = expand(self, prob) {
+            return expansion;
+        }
+
+        let Self::And(subs) = self else {
+            return PolicyExpansion {
+                leaves: vec![(prob, Arc::new(self.clone()))],
+                expanded: false,
+            };
+        };
+
+        struct Frame<'a, Pk: MiniscriptKey> {
+            subs: &'a [Arc<Policy<Pk>>],
+            next_child: usize,
+            child_index: usize,
+        }
+
+        let mut frames = vec![Frame { subs, next_child: 0, child_index: 0 }];
+        let mut expansion = None;
+        while let Some(frame) = frames.last_mut() {
+            if frame.next_child == frame.subs.len() {
+                frames.pop();
+                continue;
+            }
+
+            let child_index = frame.next_child;
+            frame.next_child += 1;
+            let child = frame.subs[child_index].as_ref();
+            if let Some(child_expansion) = expand(child, PositiveF64::ONE) {
+                frame.child_index = child_index;
+                expansion = Some(child_expansion);
+                break;
+            }
+            if let Self::And(child_subs) = child {
+                frame.child_index = child_index;
+                frames.push(Frame { subs: child_subs, next_child: 0, child_index: 0 });
+            }
+        }
+
+        let Some(expansion) = expansion else {
+            return PolicyExpansion {
+                leaves: vec![(prob, Arc::new(self.clone()))],
+                expanded: false,
+            };
+        };
+
+        let mut leaves = expansion.leaves;
+        for frame in frames.into_iter().rev() {
+            let other: Vec<_> = frame
+                .subs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != frame.child_index)
+                .map(|(_, sub)| sub.clone())
+                .collect();
+            leaves = leaves
+                .into_iter()
+                .map(|(child_prob, child_pol)| {
+                    let mut new_subs = other.clone();
+                    new_subs.insert(frame.child_index, child_pol);
+                    (child_prob, Arc::new(Self::And(new_subs)))
+                })
+                .collect();
+        }
+        PolicyExpansion {
+            leaves: leaves
+                .into_iter()
+                .map(|(child_prob, child_pol)| (prob * child_prob, child_pol))
+                .collect(),
+            expanded: true,
         }
     }
 
@@ -746,9 +796,9 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
         tapleaf_prob_vec.insert((Reverse(prob), Arc::clone(&arc_self)));
         pol_prob_map.insert(Arc::clone(&arc_self), prob);
 
-        // Since we know that policy enumeration *must* result in increase in total number of nodes,
-        // we can maintain the length of the ordered set to check if the
-        // [enumeration pass][`Policy::enumerate_pol`] results in further policy split or not.
+        // Track the number of leaves generated across expansions for the limit check. The
+        // `expanded` flag separately records progress when a single-child expansion keeps this
+        // count unchanged.
         let mut prev_len = 0usize;
         // This is required since we merge some corresponding policy nodes, so we can explicitly
         // store the variables
@@ -1480,6 +1530,28 @@ mod compiler_tests {
             .unwrap()
             .join()
             .unwrap();
+        while prefixes.pop().is_some() {}
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn compile_tr_native_deep_and() {
+        let mut prefixes = vec![Arc::new(Policy::Key("A".to_owned()))];
+        for i in 0..512 {
+            let child = Arc::clone(prefixes.last().unwrap());
+            prefixes
+                .push(Arc::new(Policy::And(vec![child, Arc::new(Policy::Key(format!("K{i}")))])));
+        }
+        let policy = Arc::clone(prefixes.last().unwrap());
+        let descriptor = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || policy.compile_tr_native(Some("INTERNAL".to_owned()), 1024))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&descriptor, Descriptor::Tr(_)));
+        drop(descriptor);
         while prefixes.pop().is_some() {}
     }
 

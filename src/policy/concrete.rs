@@ -265,6 +265,12 @@ struct TapleafProbabilityIter<'p, Pk: MiniscriptKey> {
 }
 
 #[cfg(feature = "compiler")]
+struct PolicyExpansion<Pk: MiniscriptKey> {
+    leaves: Vec<(PositiveF64, Arc<Policy<Pk>>)>,
+    expanded: bool,
+}
+
+#[cfg(feature = "compiler")]
 impl<'p, Pk: MiniscriptKey> Iterator for TapleafProbabilityIter<'p, Pk> {
     type Item = (PositiveF64, &'p Policy<Pk>);
 
@@ -348,16 +354,6 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             .map(|(_, pk)| pk.clone())
     }
 
-    /// Extracts the internal_key from this policy tree.
-    #[cfg(feature = "compiler")]
-    fn extract_key(self, unspendable_key: Option<Pk>) -> Result<(Pk, Self), CompilerError> {
-        match (self.internal_key(), unspendable_key) {
-            (Some(ref key), _) => Ok((key.clone(), self.translate_unsatisfiable_pk(key))),
-            (_, Some(key)) => Ok((key, self)),
-            _ => Err(CompilerError::NoInternalKey),
-        }
-    }
-
     /// Compiles the [`Policy`] into a [`Descriptor::Tr`].
     ///
     /// ### TapTree compilation
@@ -411,7 +407,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                                     .map_err(|_| CompilerError::HuffmanTreeDepthExceeded)?;
                                 Some(tap_tree)
                             } else {
-                                // no policies remaining once the extracted key is skipped
+                                // No script leaves remain after the key-spend leaf is skipped.
                                 None
                             }
                         }
@@ -447,8 +443,12 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             (false, _) => Err(CompilerError::TopLevelSigless),
             (_, false) => Err(CompilerError::ImpossibleNonMalleableCompilation),
             _ => {
-                let (internal_key, policy) = self.clone().extract_key(unspendable_key)?;
-                let tap_tree = match policy {
+                let selected_key = self.internal_key();
+                let internal_key = selected_key
+                    .clone()
+                    .or(unspendable_key)
+                    .ok_or(CompilerError::NoInternalKey)?;
+                let tap_tree = match self {
                     Self::Trivial => None,
                     policy => {
                         let leaves = policy.enumerate_leaves(
@@ -462,7 +462,12 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                         }
                         let mut leaf_compilations: Vec<(PositiveF64, Miniscript<Pk, Tap>)> = vec![];
                         for (leaf_idx, (prob, pol)) in leaves.iter().enumerate() {
-                            if **pol == Self::Unsatisfiable {
+                            if matches!(pol.as_ref(), Self::Unsatisfiable)
+                                || matches!(
+                                    pol.as_ref(),
+                                    Self::Key(pk) if Some(pk) == selected_key.as_ref()
+                                )
+                            {
                                 continue;
                             }
                             let compilation = compiler::best_compilation::<Pk, Tap>(pol.as_ref())?;
@@ -519,16 +524,26 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             (false, _) => Err(Error::from(CompilerError::TopLevelSigless)),
             (_, false) => Err(Error::from(CompilerError::ImpossibleNonMalleableCompilation)),
             _ => {
-                let (internal_key, policy) = self.clone().extract_key(unspendable_key)?;
+                let selected_key = self.internal_key();
+                let internal_key = selected_key
+                    .clone()
+                    .or(unspendable_key)
+                    .ok_or(CompilerError::NoInternalKey)?;
                 let tree = Descriptor::new_tr(
                     internal_key,
-                    match policy {
+                    match self {
                         Self::Trivial => None,
                         policy => {
                             let leaf_compilations: Vec<_> = policy
                                 .enumerate_policy_tree(PositiveF64::ONE)
                                 .into_iter()
-                                .filter(|x| x.1 != Arc::new(Self::Unsatisfiable))
+                                .filter(|(_, pol)| {
+                                    !matches!(pol.as_ref(), Self::Unsatisfiable)
+                                        && !matches!(
+                                            pol.as_ref(),
+                                            Self::Key(pk) if Some(pk) == selected_key.as_ref()
+                                        )
+                                })
                                 .map(|(prob, pol)| {
                                     (prob, compiler::best_compilation(pol.as_ref()).unwrap())
                                 })
@@ -608,24 +623,32 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     /// disjunction over sub-policies output by it. The probability calculations are similar
     /// to [`Policy::tapleaf_probability_iter`].
     #[cfg(feature = "compiler")]
-    fn enumerate_pol(&self, prob: PositiveF64) -> Vec<(PositiveF64, Arc<Self>)> {
+    fn enumerate_pol(&self, prob: PositiveF64) -> PolicyExpansion<Pk> {
         match self {
             Self::Or(subs) => {
                 let normalized_iter = PositiveF64::normalized_iter(subs.iter().map(|x| x.0.into()));
-                normalized_iter
-                    .zip(subs.iter())
-                    .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
-                    .collect::<Vec<_>>()
+                PolicyExpansion {
+                    leaves: normalized_iter
+                        .zip(subs.iter())
+                        .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
+                        .collect(),
+                    expanded: true,
+                }
             }
             Self::Thresh(ref thresh) if thresh.is_or() => {
                 let total_odds = PositiveF64::n(thresh);
-                thresh
-                    .iter()
-                    .map(|pol| (prob / total_odds, pol.clone()))
-                    .collect::<Vec<_>>()
+                PolicyExpansion {
+                    leaves: thresh
+                        .iter()
+                        .map(|pol| (prob / total_odds, pol.clone()))
+                        .collect(),
+                    expanded: true,
+                }
             }
-            Self::Thresh(ref thresh) if !thresh.is_and() => generate_combination(thresh, prob),
-            pol => vec![(prob, Arc::new(pol.clone()))],
+            Self::Thresh(ref thresh) if !thresh.is_and() => {
+                PolicyExpansion { leaves: generate_combination(thresh, prob), expanded: true }
+            }
+            pol => PolicyExpansion { leaves: vec![(prob, Arc::new(pol.clone()))], expanded: false },
         }
     }
 
@@ -634,46 +657,58 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     /// This ensures nested `Or` branches inside `And` nodes are decomposed into
     /// separate sub-policies, producing IF-free leaves for Taptree-native compilation.
     #[cfg(feature = "compiler")]
-    fn enumerate_pol_native(&self, prob: PositiveF64) -> Vec<(PositiveF64, Arc<Self>)> {
+    fn enumerate_pol_native(&self, prob: PositiveF64) -> PolicyExpansion<Pk> {
         match self {
             Self::Or(subs) => {
                 let normalized_iter = PositiveF64::normalized_iter(subs.iter().map(|x| x.0.into()));
-                normalized_iter
-                    .zip(subs.iter())
-                    .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
-                    .collect::<Vec<_>>()
+                PolicyExpansion {
+                    leaves: normalized_iter
+                        .zip(subs.iter())
+                        .map(|(odds, (_, pol))| (prob * odds, pol.clone()))
+                        .collect(),
+                    expanded: true,
+                }
             }
             Self::Thresh(ref thresh) if thresh.is_or() => {
                 let total_odds = PositiveF64::n(thresh);
-                thresh
-                    .iter()
-                    .map(|pol| (prob / total_odds, pol.clone()))
-                    .collect::<Vec<_>>()
+                PolicyExpansion {
+                    leaves: thresh
+                        .iter()
+                        .map(|pol| (prob / total_odds, pol.clone()))
+                        .collect(),
+                    expanded: true,
+                }
             }
-            Self::Thresh(ref thresh) if !thresh.is_and() => generate_combination(thresh, prob),
+            Self::Thresh(ref thresh) if !thresh.is_and() => {
+                PolicyExpansion { leaves: generate_combination(thresh, prob), expanded: true }
+            }
             Self::And(subs) => {
                 for (i, sub) in subs.iter().enumerate() {
                     let child_expanded = sub.enumerate_pol_native(PositiveF64::ONE);
-                    if child_expanded.len() > 1 {
+                    if child_expanded.expanded {
                         let other: Vec<_> = subs
                             .iter()
                             .enumerate()
                             .filter(|(j, _)| *j != i)
                             .map(|(_, s)| s.clone())
                             .collect();
-                        return child_expanded
-                            .into_iter()
-                            .map(|(child_prob, child_pol)| {
-                                let mut new_subs = other.clone();
-                                new_subs.insert(i, child_pol);
-                                (prob * child_prob, Arc::new(Self::And(new_subs)))
-                            })
-                            .collect();
+                        return PolicyExpansion {
+                            leaves: child_expanded
+                                .leaves
+                                .into_iter()
+                                .map(|(child_prob, child_pol)| {
+                                    let mut new_subs = other.clone();
+                                    new_subs.insert(i, child_pol);
+                                    (prob * child_prob, Arc::new(Self::And(new_subs)))
+                                })
+                                .collect(),
+                            expanded: true,
+                        };
                     }
                 }
-                vec![(prob, Arc::new(self.clone()))]
+                PolicyExpansion { leaves: vec![(prob, Arc::new(self.clone()))], expanded: false }
             }
-            pol => vec![(prob, Arc::new(pol.clone()))],
+            pol => PolicyExpansion { leaves: vec![(prob, Arc::new(pol.clone()))], expanded: false },
         }
     }
 
@@ -684,7 +719,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     /// set](`BTreeSet`) of `(prob, policy)` (ordered by probability) to maintain the list of
     /// enumerated sub-policies whose disjunction is isomorphic to initial policy (*invariant*).
     #[cfg(feature = "compiler")]
-    fn enumerate_policy_tree(self, prob: PositiveF64) -> Vec<(PositiveF64, Arc<Self>)> {
+    fn enumerate_policy_tree(&self, prob: PositiveF64) -> Vec<(PositiveF64, Arc<Self>)> {
         self.enumerate_leaves(prob, MAX_COMPILATION_LEAVES, Self::enumerate_pol)
     }
 
@@ -695,10 +730,10 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     #[cfg(feature = "compiler")]
     #[allow(clippy::type_complexity)]
     fn enumerate_leaves(
-        self,
+        &self,
         prob: PositiveF64,
         max_leaves: usize,
-        expand_fn: fn(&Self, PositiveF64) -> Vec<(PositiveF64, Arc<Self>)>,
+        expand_fn: fn(&Self, PositiveF64) -> PolicyExpansion<Pk>,
     ) -> Vec<(PositiveF64, Arc<Self>)> {
         let mut tapleaf_prob_vec = BTreeSet::<(Reverse<PositiveF64>, Arc<Self>)>::new();
         // Store probability corresponding to policy in the enumerated tree. This is required since
@@ -707,7 +742,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
         // merge the nodes by adding up the corresponding probabilities for the same policy.
         let mut pol_prob_map = BTreeMap::<Arc<Self>, PositiveF64>::new();
 
-        let arc_self = Arc::new(self);
+        let arc_self = Arc::new(self.clone());
         tapleaf_prob_vec.insert((Reverse(prob), Arc::clone(&arc_self)));
         pol_prob_map.insert(Arc::clone(&arc_self), prob);
 
@@ -732,11 +767,12 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             // from the ordered set.
             let mut to_del: Vec<(PositiveF64, Arc<Self>)> = vec![];
             'inner: for (i, (p, pol)) in tapleaf_prob_vec.iter().enumerate() {
-                curr_pol_replace_vec = expand_fn(pol, p.0);
+                let expansion = expand_fn(pol, p.0);
+                curr_pol_replace_vec = expansion.leaves;
                 enum_len += curr_pol_replace_vec.len() - 1; // A disjunctive node should have separated this into more nodes
                 assert!(prev_len <= enum_len);
 
-                if prev_len < enum_len {
+                if expansion.expanded {
                     // Plausible node found
                     found = Some((*p, Arc::clone(pol)));
                     break 'inner;
@@ -1430,6 +1466,16 @@ mod compiler_tests {
                 let descriptor = policy.compile_tr(Some("INTERNAL".to_owned())).unwrap();
                 assert_eq!(descriptor.to_string(), "tr(A)#xyg3grex");
                 drop(descriptor);
+                let descriptor = policy
+                    .compile_tr_native(Some("INTERNAL".to_owned()), 1024)
+                    .unwrap();
+                assert_eq!(descriptor.to_string(), "tr(A)#xyg3grex");
+                drop(descriptor);
+                let descriptor = policy
+                    .compile_tr_private_experimental(Some("INTERNAL".to_owned()))
+                    .unwrap();
+                assert_eq!(descriptor.to_string(), "tr(A)#xyg3grex");
+                drop(descriptor);
             })
             .unwrap()
             .join()
@@ -1526,7 +1572,7 @@ mod compiler_tests {
 
     #[test]
     fn compile_tr_private_non_expandable() {
-        // Single key: extract_key promotes it, leaving Unsatisfiable
+        // A single key is promoted to the internal key, leaving no script path.
         let pol = Policy::<String>::from_str("pk(A)").unwrap();
         let desc = pol.compile_tr_private_experimental(None).unwrap();
         assert_eq!(desc.to_string(), "tr(A)#xyg3grex");

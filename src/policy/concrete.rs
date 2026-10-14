@@ -98,25 +98,118 @@ impl<Pk: MiniscriptKey> PartialOrd for Policy<Pk> {
 
 impl<Pk: MiniscriptKey> Ord for Policy<Pk> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        match self.variant_name().cmp(other.variant_name()) {
-            cmp::Ordering::Equal => {}
-            ord => return ord,
+        enum Frame<'a, Pk: MiniscriptKey> {
+            Policy(&'a Policy<Pk>, &'a Policy<Pk>),
+            And(&'a [Arc<Policy<Pk>>], &'a [Arc<Policy<Pk>>], usize),
+            Or(&'a [(NonZeroU32, Arc<Policy<Pk>>)], &'a [(NonZeroU32, Arc<Policy<Pk>>)], usize),
+            Thresh(&'a Threshold<Arc<Policy<Pk>>, 0>, &'a Threshold<Arc<Policy<Pk>>, 0>, usize),
         }
-        match (self, other) {
-            (Self::Unsatisfiable, Self::Unsatisfiable) => cmp::Ordering::Equal,
-            (Self::Trivial, Self::Trivial) => cmp::Ordering::Equal,
-            (Self::Key(a), Self::Key(b)) => a.cmp(b),
-            (Self::After(a), Self::After(b)) => a.cmp_by_consensus(*b),
-            (Self::Older(a), Self::Older(b)) => a.cmp_by_consensus(*b),
-            (Self::Sha256(a), Self::Sha256(b)) => a.cmp(b),
-            (Self::Hash256(a), Self::Hash256(b)) => a.cmp(b),
-            (Self::Ripemd160(a), Self::Ripemd160(b)) => a.cmp(b),
-            (Self::Hash160(a), Self::Hash160(b)) => a.cmp(b),
-            (Self::And(a), Self::And(b)) => a.cmp(b),
-            (Self::Or(a), Self::Or(b)) => a.cmp(b),
-            (Self::Thresh(a), Self::Thresh(b)) => a.cmp(b),
-            _ => unreachable!("variant_name ensures same variant"),
+
+        let mut stack = vec![Frame::Policy(self, other)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Policy(left, right) => {
+                    match left.variant_name().cmp(right.variant_name()) {
+                        cmp::Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                    match (left, right) {
+                        (Self::Unsatisfiable, Self::Unsatisfiable)
+                        | (Self::Trivial, Self::Trivial) => {}
+                        (Self::Key(a), Self::Key(b)) => {
+                            let ord = a.cmp(b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::After(a), Self::After(b)) => {
+                            let ord = a.cmp_by_consensus(*b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::Older(a), Self::Older(b)) => {
+                            let ord = a.cmp_by_consensus(*b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::Sha256(a), Self::Sha256(b)) => {
+                            let ord = a.cmp(b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::Hash256(a), Self::Hash256(b)) => {
+                            let ord = a.cmp(b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::Ripemd160(a), Self::Ripemd160(b)) => {
+                            let ord = a.cmp(b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::Hash160(a), Self::Hash160(b)) => {
+                            let ord = a.cmp(b);
+                            if ord != cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        (Self::And(a), Self::And(b)) => stack.push(Frame::And(a, b, 0)),
+                        (Self::Or(a), Self::Or(b)) => stack.push(Frame::Or(a, b, 0)),
+                        (Self::Thresh(a), Self::Thresh(b)) => match a.k().cmp(&b.k()) {
+                            cmp::Ordering::Equal => stack.push(Frame::Thresh(a, b, 0)),
+                            ord => return ord,
+                        },
+                        _ => unreachable!("variant_name ensures same variant"),
+                    }
+                }
+                Frame::And(left, right, index) => {
+                    if index == left.len().min(right.len()) {
+                        match left.len().cmp(&right.len()) {
+                            cmp::Ordering::Equal => {}
+                            ord => return ord,
+                        }
+                    } else {
+                        stack.push(Frame::And(left, right, index + 1));
+                        stack.push(Frame::Policy(left[index].as_ref(), right[index].as_ref()));
+                    }
+                }
+                Frame::Or(left, right, index) => {
+                    if index == left.len().min(right.len()) {
+                        match left.len().cmp(&right.len()) {
+                            cmp::Ordering::Equal => {}
+                            ord => return ord,
+                        }
+                    } else {
+                        match left[index].0.cmp(&right[index].0) {
+                            cmp::Ordering::Equal => {}
+                            ord => return ord,
+                        }
+                        stack.push(Frame::Or(left, right, index + 1));
+                        stack.push(Frame::Policy(left[index].1.as_ref(), right[index].1.as_ref()));
+                    }
+                }
+                Frame::Thresh(left, right, index) => {
+                    if index == left.n().min(right.n()) {
+                        match left.n().cmp(&right.n()) {
+                            cmp::Ordering::Equal => {}
+                            ord => return ord,
+                        }
+                    } else {
+                        stack.push(Frame::Thresh(left, right, index + 1));
+                        stack.push(Frame::Policy(
+                            left.data()[index].as_ref(),
+                            right.data()[index].as_ref(),
+                        ));
+                    }
+                }
+            }
         }
+        cmp::Ordering::Equal
     }
 }
 

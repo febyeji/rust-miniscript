@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn tranaslate_pk() {
+    fn translate_pk() {
         pub struct TestTranslator;
         impl Translator<String> for TestTranslator {
             type TargetPk = String;
@@ -1779,5 +1779,46 @@ mod tests {
         let trivial = Policy::<String>::from_str("TRIVIAL").unwrap();
         let unsat = Policy::<String>::from_str("UNSATISFIABLE").unwrap();
         assert!(trivial < unsat, "trivial < unsatisfiable under variant_name ordering");
+
+        let and_left = Policy::<String>::from_str("and(pk(A),pk(B))").unwrap();
+        let and_right = Policy::<String>::from_str("and(pk(A),pk(C))").unwrap();
+        assert!(and_left < and_right, "And children use lexicographic ordering");
+
+        let or_left = Policy::<String>::from_str("or(1@pk(A),2@pk(B))").unwrap();
+        let or_right = Policy::<String>::from_str("or(1@pk(A),3@pk(B))").unwrap();
+        assert!(or_left < or_right, "Or weights are compared before children");
+
+        let thresh_k1 = Policy::<String>::from_str("thresh(1,pk(A),pk(B))").unwrap();
+        let thresh_k2 = Policy::<String>::from_str("thresh(2,pk(A),pk(B))").unwrap();
+        assert!(thresh_k1 < thresh_k2, "threshold k is compared before children");
+
+        let thresh_left = Policy::<String>::from_str("thresh(2,pk(A),pk(B))").unwrap();
+        let thresh_right = Policy::<String>::from_str("thresh(2,pk(A),pk(C))").unwrap();
+        assert!(thresh_left < thresh_right, "threshold children use lexicographic ordering");
+    }
+
+    #[test]
+    fn policy_ord_handles_deep_policies() {
+        fn deep_and(base: &str, depth: usize) -> (Vec<Arc<Policy<String>>>, Arc<Policy<String>>) {
+            let mut prefixes = vec![Arc::new(Policy::Key(base.to_owned()))];
+            for i in 0..depth {
+                let child = Arc::clone(prefixes.last().unwrap());
+                prefixes.push(Arc::new(Policy::And(vec![
+                    child,
+                    Arc::new(Policy::Key(format!("K{i}"))),
+                ])));
+            }
+            let root = Arc::clone(prefixes.last().unwrap());
+            (prefixes, root)
+        }
+
+        let (left_prefixes, left) = deep_and("A", 2048);
+        let (right_prefixes, right) = deep_and("B", 2048);
+        assert!(left < right, "deep policy ordering must not use the call stack");
+
+        drop(left);
+        drop(right);
+        drop(left_prefixes);
+        drop(right_prefixes);
     }
 }
